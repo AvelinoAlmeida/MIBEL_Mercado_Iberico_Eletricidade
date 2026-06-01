@@ -1,0 +1,480 @@
+# =============================================================================
+# DATA CONTRACT — DP02 Streaming_Data
+# Estrutura conforme: Scalable Technologies for Data Analysis (Davide Carneiro, 2025/2026)
+# Cobre os dois produtos Gold: dp_energy_market_api_hourly e feat_load_forecasting_api_hourly
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# CONTRACT 1 — Produto analítico principal
+# -----------------------------------------------------------------------------
+contract:
+  id: dp02-api-energy-market-v1
+  name: dp_energy_market_api_hourly
+  version: v1
+  status: active
+  producer: pipeline-dp02-streaming
+  effective_date: "2022-01-01"
+  domain: energia/mercado-eletrico
+  owner: equipa-engenharia-dados
+  description: >
+    Contrato formal entre o pipeline de ingestão (produtor — Energy-Charts API por defeito sem
+    autenticação; ENTSO-E Transparency Platform como alternativa com token gratuito) e os
+    consumidores (Grafana, analistas, ML pipeline).
+    Garante disponibilidade, schema, qualidade e comportamento da tabela
+    iceberg.gold.dp_energy_market_api_hourly.
+
+# -----------------------------------------------------------------------------
+# INTERFACE — onde e como aceder ao produto
+# -----------------------------------------------------------------------------
+interface:
+  table: iceberg.gold.dp_energy_market_api_hourly
+  catalog: iceberg
+  schema_name: gold
+  grain: 1 registo por hora UTC
+  primary_key: ts_utc
+  temporal_coverage:
+    start: "2022-01-01T00:00:00Z"
+    end: presente (pipeline incremental)
+  partitioning:
+    - column: year
+      type: INTEGER
+    - column: month
+      type: INTEGER
+  access:
+    protocol: Trino JDBC/DBAPI
+    host: localhost
+    port: 8080
+    datasource_uid: trino-iceberg  # UID Grafana
+  consumers:
+    - id: grafana-dashboard
+      type: dashboard
+      description: Dashboard "DP02 — Preço Day-Ahead Portugal" (Grafana)
+    - id: ml-feat-table
+      type: upstream
+      description: Input do workflow gold → feat_load_forecasting_api_hourly
+    - id: analytics-adhoc
+      type: analytics
+      description: Consultas ad-hoc via Trino por analistas e cientistas de dados
+
+# -----------------------------------------------------------------------------
+# SCHEMA — definição formal das colunas
+# -----------------------------------------------------------------------------
+schema:
+  version: 1
+  columns:
+    - name: ts_utc
+      type: "TIMESTAMP(6) WITH TIME ZONE"
+      nullable: false
+      role: primary_key
+      description: Timestamp UTC do início da hora (chave de negócio única)
+
+    - name: consumo_total
+      type: DOUBLE
+      nullable: false
+      unit: MWh
+      description: Carga eléctrica horária nacional Portugal (MW convertido para MWh na Silver)
+
+    - name: market_price_pt
+      type: DOUBLE
+      nullable: false
+      unit: EUR/MWh
+      description: Preço day-ahead Portugal no mercado MIBEL (ENTSO-E query_day_ahead_prices)
+
+    - name: hora
+      type: INTEGER
+      nullable: false
+      range: [0, 23]
+      description: Hora do dia extraída de ts_utc
+
+    - name: dia_semana
+      type: INTEGER
+      nullable: false
+      range: [0, 6]
+      description: "Dia da semana: 0=Segunda, 1=Terça, ..., 6=Domingo"
+
+    - name: is_weekend
+      type: BOOLEAN
+      nullable: false
+      description: "TRUE se dia_semana IN (5, 6) — Sábado ou Domingo"
+
+    - name: consumo_lag_1h
+      type: DOUBLE
+      nullable: true
+      unit: MWh
+      description: Consumo na hora anterior — NULL nas primeiras horas do histórico
+
+    - name: consumo_lag_24h
+      type: DOUBLE
+      nullable: true
+      unit: MWh
+      description: Consumo 24h antes (mesmo slot do dia anterior) — NULL nas primeiras 24h
+
+    - name: price_lag_1h
+      type: DOUBLE
+      nullable: true
+      unit: EUR/MWh
+      description: Preço day-ahead na hora anterior — NULL na primeira hora
+
+    - name: rolling_avg_consumo_24h
+      type: DOUBLE
+      nullable: true
+      unit: MWh
+      description: Média móvel de consumo das últimas 24h (janela inclusiva)
+
+    - name: rolling_avg_price_24h
+      type: DOUBLE
+      nullable: true
+      unit: EUR/MWh
+      description: Média móvel de preço das últimas 24h (janela inclusiva)
+
+    - name: process_date
+      type: DATE
+      nullable: false
+      description: Data de execução do pipeline (rastreabilidade de reprocessamento)
+
+    - name: year
+      type: INTEGER
+      nullable: false
+      description: Ano — coluna de partição Iceberg
+
+    - name: month
+      type: INTEGER
+      nullable: false
+      description: Mês — coluna de partição Iceberg
+
+# -----------------------------------------------------------------------------
+# SEMANTICS — significado e regras de negócio
+# -----------------------------------------------------------------------------
+semantics:
+  definitions:
+    consumo_total: >
+      Representa a carga eléctrica total nacional de Portugal (Actual Total Load)
+      conforme reportado pela ENTSO-E. Unidade: MWh por hora. Derivado de MW × 1h
+      na camada Silver (granularidade já horária — não é uma soma de 15min).
+    market_price_pt: >
+      Preço day-ahead de Portugal no mercado MIBEL (Mercado Ibérico de Energia).
+      Publicado pelo OMIE no dia anterior (D-1) para todas as 24h do dia D.
+      Preços negativos são válidos e ocorrem quando existe excesso de geração renovável.
+    consumo_lag_1h: >
+      Window function LAG(consumo_total, 1) sobre o histórico completo ordenado por ts_utc.
+      Calculado na Gold a partir de todo o histórico Silver para evitar quebras nos limites
+      de partição.
+    rolling_avg_consumo_24h: >
+      AVG(consumo_total) sobre uma janela de 24 linhas anteriores + linha atual,
+      ordenado por ts_utc. Representa o perfil de consumo típico num ciclo diário.
+    hora: >
+      Derivado de HOUR(ts_utc). Representa o slot horário no ciclo diário (0=meia-noite,
+      23=23h). Usado como feature primária na análise de perfis horários de preço.
+
+  business_rules:
+    - rule: ts_utc é sempre UTC — sem ajuste de DST ou fuso local
+    - rule: Apenas horas com consumo E preço disponíveis são incluídas (INNER JOIN)
+    - rule: Preços negativos são registados e reportados (WARN) — não são erros
+    - rule: Duplicados ocasionais da API são resolvidos por AVG na Silver (afeta ambas as fontes)
+
+# -----------------------------------------------------------------------------
+# QUALITY — regras de qualidade contratualmente garantidas
+# -----------------------------------------------------------------------------
+quality:
+  enforcement: quality checks SQL executados pelo Flyte antes de promoção para Gold
+
+  rules:
+    - id: QC-G01
+      name: unicidade_ts_utc
+      column: ts_utc
+      check: COUNT(*) = COUNT(DISTINCT ts_utc)
+      severity: FAIL
+      description: Zero duplicados — o produtor garante unicidade horária
+
+    - id: QC-G02
+      name: consumo_nao_nulo
+      column: consumo_total
+      check: COUNT(*) WHERE consumo_total IS NULL = 0
+      severity: FAIL
+      description: Null rate = 0% em consumo_total
+
+    - id: QC-G03
+      name: preco_nao_nulo
+      column: market_price_pt
+      check: COUNT(*) WHERE market_price_pt IS NULL = 0
+      severity: FAIL
+      description: Null rate = 0% em market_price_pt
+
+    - id: QC-G04
+      name: consumo_positivo
+      column: consumo_total
+      check: consumo_total >= 0
+      severity: FAIL
+      description: Consumo não pode ser negativo
+
+    - id: QC-G05
+      name: hora_range
+      column: hora
+      check: hora BETWEEN 0 AND 23
+      severity: FAIL
+      description: Slot horário válido no ciclo diário
+
+    - id: QC-G06
+      name: dia_semana_range
+      column: dia_semana
+      check: dia_semana BETWEEN 0 AND 6
+      severity: FAIL
+      description: Dia da semana válido (ISO 0=Segunda)
+
+    - id: QC-G07
+      name: consistencia_lag
+      column: consumo_lag_1h
+      check: ABS(consumo_lag_1h(t) - consumo_total(t-1)) <= 0.001 MWh
+      severity: FAIL
+      max_inconsistency_pct: 0.1
+      description: Lag deve corresponder ao valor anterior com tolerância de 0.001 MWh
+
+    - id: QC-G08
+      name: taxa_join
+      check: linhas_gold / MIN(linhas_consumo_silver, linhas_preco_silver) >= 0.98
+      severity: FAIL
+      target_pct: 98
+      description: Taxa de junção consumo × preço >= 98% das horas disponíveis
+
+    - id: QC-G09
+      name: preco_negativo
+      column: market_price_pt
+      check: COUNT(*) WHERE market_price_pt < 0
+      severity: WARN
+      description: Preços negativos são válidos no MIBEL — contabilizados e reportados
+
+# -----------------------------------------------------------------------------
+# BEHAVIOR — como o produtor se comporta
+# -----------------------------------------------------------------------------
+behavior:
+  slo:
+    freshness:
+      target: T+45min após fecho da hora
+      max_acceptable_hours: 4
+      measurement: MAX(ts_utc) vs NOW()
+
+    availability:
+      target_pct: 99.0
+      scope: tabela disponível para query via Trino
+
+    null_rate_core:
+      columns: [consumo_total, market_price_pt]
+      target_pct: 0
+
+    join_rate:
+      target_pct: 98
+      description: Percentagem de horas com dados de consumo e preço simultâneos
+
+  sla:
+    idempotency: >
+      Múltiplas execuções do mesmo intervalo produzem o mesmo resultado.
+      A tabela Gold é reconstruída integralmente a cada execução (DELETE + INSERT).
+    backfill: >
+      Qualquer partição year/month pode ser re-materializada a partir da Silver
+      sem perda de dados.
+    failure_handling: >
+      Em caso de FAIL nos quality checks, a execução aborta antes de promover
+      a partição. Os dados Bronze/Silver são preservados para diagnóstico.
+    retries: 1 retry automático por workflow Flyte em caso de falha transitória
+
+# -----------------------------------------------------------------------------
+# CHANGE MANAGEMENT — política de evolução do schema
+# -----------------------------------------------------------------------------
+change_management:
+  versioning_properties:
+    schema_version: Iceberg table property — incrementado em alterações minor
+    product_version: Iceberg table property — nova versão em breaking changes
+    deprecated: Iceberg table property — true quando substituído
+
+  change_types:
+    patch:
+      description: Correções de documentação, comentários, descrições de colunas
+      action: sem alteração de schema; atualizar este ficheiro
+      breaking: false
+
+    minor:
+      description: Adicionar nova coluna nullable, novo índice de oportunidade, nova feature de lag
+      action: >
+        ALTER TABLE ... ADD COLUMN (nullable).
+        Incrementar schema_version.
+        Atualizar secção schema neste contrato.
+      breaking: false
+      consumer_impact: none — nova coluna é ignorada por consumidores anteriores
+
+    major:
+      description: >
+        Remover coluna existente, alterar tipo, alterar grão, alterar semântica de
+        coluna existente (ex: unidade MWh → kWh, redefinição de lag)
+      action: >
+        1. Criar nova tabela dp_energy_market_api_hourly_v2
+        2. Definir product_version=v2
+        3. Marcar tabela v1 com deprecated=true
+        4. Comunicar todos os consumidores registados
+        5. Janela de coexistência mínima: 30 dias
+        6. Remover v1 apenas após migração completa de todos os consumidores
+      breaking: true
+
+  compatibility_guarantees:
+    - Colunas existentes nunca são removidas dentro da mesma versão major
+    - Tipos de colunas existentes nunca são alterados em produção
+    - ts_utc como chave de negócio é imutável dentro de v1
+    - Grão (1 linha por hora UTC) é imutável dentro de v1
+
+  changelog:
+    - version: v1
+      schema_version: 1
+      date: "2022-01-01"
+      description: >
+        Versão inicial — 13 colunas + 2 de partição.
+        Fontes suportadas: Energy-Charts API (default, sem autenticação) e ENTSO-E Transparency Platform (alternativa, token gratuito).
+        Sufixo _api para coexistência com pipeline Static_Data.
+
+# -----------------------------------------------------------------------------
+# EXAMPLES — exemplos de utilização
+# -----------------------------------------------------------------------------
+examples:
+
+  - title: Perfil horário de preço médio (resposta à pergunta de negócio)
+    description: Identifica as horas do dia com preço sistematicamente mais alto
+    sql: |
+      SELECT
+        hora,
+        ROUND(AVG(market_price_pt), 2) AS preco_medio_eur_mwh,
+        COUNT(*) AS n_observacoes
+      FROM iceberg.gold.dp_energy_market_api_hourly
+      WHERE market_price_pt IS NOT NULL
+      GROUP BY hora
+      ORDER BY preco_medio_eur_mwh DESC
+
+  - title: Índice de oportunidade de venda por hora
+    description: >
+      Horas onde o preço é relativamente alto e o consumo é relativamente baixo
+      representam a melhor janela para vender energia renovável à rede.
+    sql: |
+      WITH hourly AS (
+        SELECT
+          hora,
+          AVG(market_price_pt) AS avg_price,
+          AVG(consumo_total)   AS avg_consumo
+        FROM iceberg.gold.dp_energy_market_api_hourly
+        WHERE market_price_pt IS NOT NULL AND consumo_total IS NOT NULL
+        GROUP BY hora
+      ),
+      maxes AS (
+        SELECT MAX(avg_price) AS max_price, MAX(avg_consumo) AS max_consumo
+        FROM hourly
+      )
+      SELECT
+        h.hora,
+        ROUND((h.avg_price / m.max_price - h.avg_consumo / m.max_consumo) * 100, 1)
+          AS indice_oportunidade_pct
+      FROM hourly h, maxes m
+      ORDER BY indice_oportunidade_pct DESC
+
+  - title: Evolução mensal do preço médio
+    description: Tendência de preços ao longo do tempo
+    sql: |
+      SELECT
+        year,
+        month,
+        ROUND(AVG(market_price_pt), 2) AS preco_medio,
+        ROUND(MIN(market_price_pt), 2) AS preco_minimo,
+        ROUND(MAX(market_price_pt), 2) AS preco_maximo
+      FROM iceberg.gold.dp_energy_market_api_hourly
+      WHERE market_price_pt IS NOT NULL
+      GROUP BY year, month
+      ORDER BY year, month
+
+  - title: Verificação de freshness
+    description: Confirmar que os dados estão atualizados
+    sql: |
+      SELECT
+        MAX(ts_utc) AS ultimo_registo,
+        CURRENT_TIMESTAMP AS agora,
+        date_diff('hour', MAX(ts_utc), CURRENT_TIMESTAMP) AS horas_atraso
+      FROM iceberg.gold.dp_energy_market_api_hourly
+
+  - title: Quality check — unicidade e nulos
+    description: Verificação manual das regras QC-G01, QC-G02, QC-G03
+    sql: |
+      SELECT
+        COUNT(*) AS total_registos,
+        COUNT(DISTINCT ts_utc) AS ts_unicos,
+        SUM(CASE WHEN consumo_total IS NULL THEN 1 ELSE 0 END) AS nulos_consumo,
+        SUM(CASE WHEN market_price_pt IS NULL THEN 1 ELSE 0 END) AS nulos_preco,
+        SUM(CASE WHEN market_price_pt < 0 THEN 1 ELSE 0 END) AS precos_negativos
+      FROM iceberg.gold.dp_energy_market_api_hourly
+
+---
+# =============================================================================
+# CONTRACT 2 — Feature Table ML
+# =============================================================================
+
+feat_load_forecasting_contract:
+  id: dp02-api-feat-load-forecasting-v1
+  name: feat_load_forecasting_api_hourly
+  version: v1
+  status: active
+  producer: pipeline-dp02-streaming
+  effective_date: "2022-01-01"
+
+interface:
+  table: iceberg.gold.feat_load_forecasting_api_hourly
+  grain: 1 registo por hora UTC (linhas com lags nulos e sem target excluídas)
+  primary_key: ts_utc
+  note: >
+    As primeiras 24 linhas (lags ainda nulos) e a última linha da série (sem target futuro)
+    são excluídas. O dataset está pronto para treino sem pré-processamento adicional.
+  consumers:
+    - id: ml-training-gbr
+      type: ml-training
+      script: 03_ml_pipeline/preco_consumo_mlflow_flow.py
+      model: GradientBoostingRegressor
+      target_column: consumo_next_hour
+      metrics_achieved:
+        r2: 0.989
+        mape_pct: 1.30
+
+schema:
+  version: 1
+  feature_schema_version: 1
+  note: Todas as colunas de dp_energy_market_api_hourly mais consumo_next_hour
+  additional_column:
+    - name: consumo_next_hour
+      type: DOUBLE
+      nullable: false
+      role: TARGET
+      description: >
+        Consumo da hora seguinte — LEAD(consumo_total, 1) OVER (ORDER BY ts_utc).
+        Variável alvo para o modelo de previsão de carga horária.
+
+quality:
+  rules:
+    - id: QC-F01
+      name: target_nao_nulo
+      column: consumo_next_hour
+      check: null_rate = 0%
+      severity: FAIL
+
+    - id: QC-F02
+      name: features_sem_nulos
+      check: todos os campos lag e rolling_avg NOT NULL
+      severity: FAIL
+
+    - id: QC-F03
+      name: paridade_com_produto_analitico
+      check: COUNT(feat) >= COUNT(dp) - 48
+      severity: WARN
+      description: Diferença esperada de até 25 linhas (24 inicio + 1 fim) por re-execução
+
+change_management:
+  versioning_property: feature_schema_version
+  impact_on_models: >
+    Qualquer alteração ao conjunto ou fórmula de features obriga a re-treino.
+    Cada run MLflow deve registar feature_schema_version nos tags do run.
+  changelog:
+    - feature_schema_version: 1
+      date: "2022-01-01"
+      features: 10
+      target: consumo_next_hour
+      model_trained: GradientBoostingRegressor (R²=0.989, MAPE=1.30%)

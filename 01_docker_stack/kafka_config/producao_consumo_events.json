@@ -1,0 +1,16 @@
+{
+  "tableName": "producao_consumo_events",
+  "schemaName": "default",
+  "topicName": "producao_consumo_events",
+  "message": {
+    "dataFormat": "json",
+    "fields": [
+      { "name": "event_id", "mapping": "event_id", "type": "VARCHAR" },
+      { "name": "timestamp_utc", "mapping": "timestamp_utc", "type": "VARCHAR" },
+      { "name": "consumo_total_kwh", "mapping": "consumo_total_kwh", "type": "DOUBLE" },
+      { "name": "producao_total_kwh", "mapping": "producao_total_kwh", "type": "DOUBLE" },
+      { "name": "saldo_kwh", "mapping": "saldo_kwh", "type": "DOUBLE" },
+      { "name": "origem", "mapping": "origem", "type": "VARCHAR" }
+    ]
+  }
+}

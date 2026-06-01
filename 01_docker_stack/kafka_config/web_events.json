@@ -1,0 +1,40 @@
+{
+    "tableName": "web_events",
+    "schemaName": "default",
+    "topicName": "web_events",
+    "message": {
+        "dataFormat": "json",
+        "fields": [
+            {
+                "name": "event_id",
+                "mapping": "event_id",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "event_type",
+                "mapping": "event_type",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "customer_id",
+                "mapping": "customer_id",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "item_id",
+                "mapping": "item_id",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "amount",
+                "mapping": "amount",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "event_time",
+                "mapping": "event_time",
+                "type": "VARCHAR"
+            }
+        ]
+    }
+}

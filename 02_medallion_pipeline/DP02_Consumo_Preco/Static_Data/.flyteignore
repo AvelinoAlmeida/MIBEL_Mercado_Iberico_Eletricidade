@@ -1,0 +1,10 @@
+# Ficheiros excluídos do upload de fast registration (--copy all).
+# Os CSVs raw são grandes e são enviados separadamente para MinIO via boto3.
+
+01_bronze/data/
+__pycache__/
+.venv_medallion_consumo_preco/
+*.pyc
+*.pyo
+*.egg-info/
+.DS_Store

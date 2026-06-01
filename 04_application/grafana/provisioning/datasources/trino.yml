@@ -1,0 +1,15 @@
+apiVersion: 1
+
+datasources:
+  - name: Trino-Iceberg
+    uid: trino-iceberg
+    type: trino-datasource
+    access: proxy
+    url: http://trino:8080
+    isDefault: true
+    jsonData:
+      catalog: iceberg
+      schema: gold
+      user: grafana
+      tlsSkipVerify: true
+      tlsAuth: false

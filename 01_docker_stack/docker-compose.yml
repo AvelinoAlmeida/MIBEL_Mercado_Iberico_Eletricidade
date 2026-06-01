@@ -1,0 +1,131 @@
+name: projeto_mibel
+
+services:
+  # --- S3-compatible storage ---
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
+    volumes:
+      - minio-data:/data
+
+  # Create buckets for Iceberg warehouse + MLflow artifacts
+  mc:
+    image: minio/mc:latest
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done;
+      mc mb -p local/warehouse;
+      mc mb -p local/mlflow;
+      mc mb -p local/flyte;
+      exit 0;
+      "
+
+  # --- Iceberg catalog (Hive Metastore + DB) ---
+  metastore-db:
+    image: mariadb:10.11
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+      MYSQL_DATABASE: metastore_db
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: admin
+    volumes:
+      - metastore-db:/var/lib/mysql
+
+  hive-metastore:
+    image: bitsondatadev/hive-metastore:latest
+    depends_on: [metastore-db, minio]
+    ports:
+      - "9083:9083"
+    environment:
+      METASTORE_DB_HOSTNAME: metastore-db
+      METASTORE_TYPE: mysql
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    volumes:
+      - ./hive/conf:/opt/apache-hive-metastore-3.0.0-bin/conf:ro
+
+  # --- Streaming (Kafka-compatible) ---
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.2.1
+    container_name: redpanda
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+
+  trino:
+    image: trinodb/trino:468
+    restart: unless-stopped
+    depends_on: [hive-metastore, redpanda]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/etc:/etc/trino
+      - trino-data:/data/trino
+      - ./kafka_config:/etc/trino/kafka
+
+  mlflow-db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: mlflow
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: mlflow
+    volumes:
+      - mlflow-db:/var/lib/postgresql/data
+
+
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    depends_on: [trino]
+    ports:
+      - "${GRAFANA_PORT:-3300}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: trino-datasource
+    volumes:
+      - ../04_application/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../04_application/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+  # NOTE: Flyte Sandbox runs as a separate external container via flytectl.
+  # Run independently: flytectl demo start
+  # UI: http://localhost:30080
+
+  mlflow:
+    build:
+      context: mlflow
+      dockerfile: Dockerfile
+    image: tead-mlflow:v3.10.1
+    depends_on: [mlflow-db, minio, mc]
+    ports:
+      - "15000:5000"
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    command: >
+      mlflow server
+      --host 0.0.0.0 --port 5000
+      --allowed-hosts "localhost:5000,localhost:15000,host.docker.internal:15000,host.docker.internal:5000"
+      --backend-store-uri postgresql://mlflow:mlflow@mlflow-db:5432/mlflow
+      --default-artifact-root s3://mlflow/
+volumes:
+  minio-data:
+  metastore-db:
+  mlflow-db:
+  trino-data:
+  grafana-data:

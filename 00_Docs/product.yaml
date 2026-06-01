@@ -1,0 +1,279 @@
+# =============================================================================
+# DATA PRODUCT — DP02 Streaming_Data
+# Estrutura conforme: Scalable Technologies for Data Analysis (Davide Carneiro, 2025/2026)
+# =============================================================================
+
+product:
+  id: dp02-streaming-energy-market
+  name: dp_energy_market_api_hourly
+  version: v1
+  domain: energia/mercado-eletrico
+  subdomain: consumo-preco-streaming
+  owner: equipa-engenharia-dados
+  description: >
+    Produto analítico horário que integra carga eléctrica nacional (MWh) e preço
+    day-ahead Portugal (€/MWh). Fonte por defeito: Energy-Charts API (sem autenticação);
+    alternativa: ENTSO-E Transparency Platform (token gratuito).
+    Responde à pergunta de negócio: "Em que intervalo horário diário é mais
+    vantajoso vender energia renovável à rede?"
+  status: active
+  tags:
+    - energia
+    - mercado-eletrico
+    - mibel
+    - entsoe
+    - portugal
+    - streaming
+    - hourly
+
+# -----------------------------------------------------------------------------
+# DELIVERY — o que este produto entrega e a quem
+# -----------------------------------------------------------------------------
+delivery:
+  output_tables:
+    - name: iceberg.gold.dp_energy_market_api_hourly
+      description: Produto analítico principal — preço e consumo com features de calendário, lags e médias móveis
+      grain: 1 linha por hora UTC
+      primary_key: ts_utc
+      consumers:
+        - type: dashboard
+          system: Grafana
+          dashboard: consumo_preco_streaming_overview
+          datasource: trino-iceberg
+        - type: analytics
+          system: Trino
+          description: Exploração ad-hoc por analistas e cientistas de dados
+
+    - name: iceberg.gold.feat_load_forecasting_api_hourly
+      description: Feature table ML derivada do produto analítico com variável alvo consumo_next_hour
+      grain: 1 linha por hora UTC (primeiras 24h e última excluídas)
+      primary_key: ts_utc
+      consumers:
+        - type: ml-training
+          system: MLflow + Flyte
+          script: 03_ml_pipeline/preco_consumo_mlflow_flow.py
+          model: GradientBoostingRegressor
+          metrics:
+            r2: 0.989
+            mape_pct: 1.30
+
+  update_frequency: continuous  # pipeline pode re-executar para qualquer intervalo
+  latency_target: T+45min       # dados disponíveis até 45 minutos após fecho da hora
+  freshness_slo_hours: 4
+
+# -----------------------------------------------------------------------------
+# PRODUCTION — como o produto é produzido
+# -----------------------------------------------------------------------------
+production:
+  pipeline_type: batch-on-demand  # execução Flyte via pyflyte run
+  orchestrator: Flyte
+  entrypoint: run_streaming_pipeline.py
+  idempotent: true
+  layers:
+
+    bronze:
+      tables:
+        - iceberg.bronze.consumo_api_raw
+        - iceberg.bronze.preco_api_raw
+      ddl: 01_bronze/bronze_streaming_ddl.sql
+      workflow_default: workflows/flyte_fetch_bronze_energycharts.py   # --source energycharts (sem auth)
+      workflow_alt: workflows/flyte_fetch_bronze_api.py                # --source entsoe (requer ENTSOE_TOKEN)
+      tasks:
+        - fetch_bronze_energycharts   # Energy-Charts API (default, sem autenticação)
+        - fetch_consumo_api           # ENTSO-E query_load('PT') via entsoe-py (alternativa)
+        - fetch_preco_api             # ENTSO-E query_day_ahead_prices('PT'/'ES') via entsoe-py (alternativa)
+      parallelism: tasks correm em paralelo
+      auth: nenhuma (Energy-Charts) | ENTSOE_TOKEN variável de ambiente (ENTSO-E)
+
+    silver:
+      tables:
+        - iceberg.silver.consumo_api_hourly
+        - iceberg.silver.preco_api_hourly
+      workflow: workflows/flyte_bronze_to_silver.py
+      transformations:
+        - filtragem de nulos e valores <= 0
+        - deduplicação por ts_utc (AVG em duplicados ocasionais da API)
+        - conversão MW → MWh (granularidade horária: total_mwh = AVG(total))
+        - alinhamento horário DATE_TRUNC('hour', ts_utc)
+        - derivação de colunas de partição year e month
+
+    gold:
+      tables:
+        - iceberg.gold.dp_energy_market_api_hourly
+        - iceberg.gold.feat_load_forecasting_api_hourly
+      workflow: workflows/flyte_silver_to_gold.py
+      transformations:
+        - INNER JOIN consumo_api_hourly × preco_api_hourly por ts_utc
+        - features de calendário: hora (0-23), dia_semana (0=Seg), is_weekend
+        - lags temporais: consumo_lag_1h, consumo_lag_24h, price_lag_1h
+        - médias móveis 24h: rolling_avg_consumo_24h, rolling_avg_price_24h
+        - target ML: consumo_next_hour = LEAD(consumo_total, 1)
+        - filtro feat table: remove primeiras 24 linhas (lags nulos) e última (sem target)
+
+  compute:
+    query_engine: Trino
+    storage: Apache Iceberg (format_version=2, Parquet)
+    object_store: MinIO s3a://warehouse/
+    metastore: Hive Metastore (thrift://localhost:9083)
+
+# -----------------------------------------------------------------------------
+# LINEAGE — rastreabilidade da origem ao produto
+# -----------------------------------------------------------------------------
+lineage:
+  upstream_sources:
+    - name: Energy-Charts API (Fraunhofer ISE)   # DEFAULT — sem autenticação
+      url: https://api.energy-charts.info
+      auth_type: nenhuma
+      endpoints:
+        - endpoint: GET /total_power?country=pt
+          data: Actual Total Load Portugal
+          unit: MW
+          granularity: horária
+        - endpoint: GET /price?bzn=PT
+          data: Preço Day-Ahead Portugal
+          unit: EUR/MWh
+          granularity: horária
+        - endpoint: GET /price?bzn=ES
+          data: Preço Day-Ahead Espanha
+          unit: EUR/MWh
+          granularity: horária
+      flag: --source energycharts
+      coverage_start: "2022-01-01"
+
+    - name: ENTSO-E Transparency Platform   # ALTERNATIVA — requer token gratuito
+      url: https://transparency.entsoe.eu/
+      auth_type: API Token (gratuito — pedido por email a transparency@entsoe.eu)
+      endpoints:
+        - query: query_load('PT')
+          data: Actual Total Load Portugal
+          unit: MW
+          granularity: horária
+        - query: query_day_ahead_prices('PT')
+          data: Preço Day-Ahead Portugal
+          unit: EUR/MWh
+          granularity: horária
+        - query: query_day_ahead_prices('ES')
+          data: Preço Day-Ahead Espanha
+          unit: EUR/MWh
+          granularity: horária
+      library: entsoe-py
+      flag: --source entsoe
+      coverage_start: "2022-01-01"
+
+  data_flow:
+    - step: Energy-Charts API → bronze.consumo_api_raw (default)
+      file: workflows/flyte_fetch_bronze_energycharts.py::fetch_bronze_energycharts
+    - step: Energy-Charts API → bronze.preco_api_raw (default)
+      file: workflows/flyte_fetch_bronze_energycharts.py::fetch_bronze_energycharts
+    - step: ENTSO-E API → bronze.consumo_api_raw (alternativa)
+      file: workflows/flyte_fetch_bronze_api.py::fetch_consumo_api
+    - step: ENTSO-E API → bronze.preco_api_raw (alternativa)
+      file: workflows/flyte_fetch_bronze_api.py::fetch_preco_api
+    - step: bronze → silver.consumo_api_hourly
+      file: workflows/flyte_bronze_to_silver.py
+    - step: bronze → silver.preco_api_hourly
+      file: workflows/flyte_bronze_to_silver.py
+    - step: silver × silver → gold.dp_energy_market_api_hourly
+      file: workflows/flyte_silver_to_gold.py::build_dp_energy_market_api_full
+    - step: gold → gold.feat_load_forecasting_api_hourly
+      file: workflows/flyte_silver_to_gold.py::build_feat_load_forecasting_api_full
+
+  standalone_scripts:
+    - path: 01_bronze/scripts/python/fetch_consumo_entsoe.py
+      description: Ingestão standalone de consumo (debug / repopulação pontual)
+    - path: 01_bronze/scripts/python/fetch_preco_entsoe.py
+      description: Ingestão standalone de preços (debug / repopulação pontual)
+
+# -----------------------------------------------------------------------------
+# OBSERVABILITY — monitorização e qualidade
+# -----------------------------------------------------------------------------
+observability:
+  quality_framework: SQL checks (sem unit tests — conforme arquitetura do projeto)
+  quality_gate_location: workflows/flyte_quality_checks.py
+
+  checks:
+    bronze:
+      - check: nulos em ts_utc
+        level: FAIL
+      - check: nulos em total (consumo)
+        level: FAIL
+      - check: nulos em price_portugal_eur_mwh
+        level: FAIL
+      - check: total > 0 (MW positivo)
+        level: WARN  # valores negativos são possíveis em ENTSO-E
+      - check: unicidade ts_utc (consumo)
+        level: FAIL
+      - check: unicidade ts_utc (preço)
+        level: FAIL
+      - check: freshness consumo <= 3 dias
+        level: WARN
+      - check: freshness preço <= 2 dias
+        level: WARN
+      - check: preço PT não-negativo
+        level: WARN  # preços negativos possíveis no MIBEL
+      - check: completude diária >= 23h/dia
+        level: WARN
+
+    silver:
+      - check: zero nulos em ts_utc e total_mwh
+        level: FAIL
+      - check: unicidade ts_utc após deduplicação
+        level: FAIL
+
+    gold:
+      - check: unicidade ts_utc
+        level: FAIL
+      - check: consumo_total >= 0
+        level: FAIL
+      - check: market_price_pt não-nulo
+        level: FAIL
+        target_null_rate: 0%
+      - check: null rate consumo_next_hour (feat table)
+        level: FAIL
+        target_null_rate: 0%
+      - check: consistência lag consumo_lag_1h = consumo_total(t-1)
+        level: FAIL
+        tolerance_mwh: 0.001
+      - check: taxa de junção consumo × preço >= 98%
+        level: FAIL
+      - check: preços negativos (WARN — ocorrem no MIBEL)
+        level: WARN
+
+  freshness_monitoring:
+    method: MAX(ts_utc) vs CURRENT_TIMESTAMP
+    alert_threshold_hours: 4
+    dashboard_panel: "KPIs — Preço Day-Ahead Portugal"
+
+  grafana_dashboard: consumo_preco_streaming_overview.json
+
+# -----------------------------------------------------------------------------
+# GOVERNANCE — políticas e acesso
+# -----------------------------------------------------------------------------
+governance:
+  data_classification: público  # dados publicados na plataforma ENTSO-E
+  pii: false
+  license: ENTSO-E Transparency Platform Terms of Use
+  access_control:
+    read: todos os utilizadores com acesso ao cluster Trino
+    write: apenas o pipeline de ingestão (via Flyte tasks)
+  retention:
+    bronze: indefinida (raw, para reprocessamento)
+    silver: indefinida
+    gold: indefinida (dataset de treino ML necessita histórico completo)
+  schema_version_property: schema_version (Iceberg table property)
+  product_version_property: product_version (Iceberg table property)
+  feature_schema_version_property: feature_schema_version (feat table apenas)
+  deprecation_policy: >
+    Tabela marcada com deprecated=true em Iceberg table properties.
+    Coexistência mínima de 30 dias antes de remoção.
+
+# -----------------------------------------------------------------------------
+# REFERENCES — documentação relacionada
+# -----------------------------------------------------------------------------
+references:
+  pipeline_summary: 02_medallion_pipeline/DP02_Consumo_Preco/Streaming_Data/DP02_Pipeline.md
+  data_contract: 00_Docs/contract.yaml
+  grafana_dashboard: 04_application/grafana/dashboards/consumo_preco_streaming_overview.json
+  ml_script: 03_ml_pipeline/preco_consumo_streaming_mlflow_flow.py
+  entsoe_api_docs: https://transparency.entsoe.eu/content/static_content/Static%20content/web%20api/Guide.html
+  entsoe_py_docs: https://github.com/EnergieID/entsoe-py

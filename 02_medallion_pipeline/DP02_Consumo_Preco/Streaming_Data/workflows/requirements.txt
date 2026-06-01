@@ -1,0 +1,5 @@
+flytekit>=1.10.0
+trino>=0.328.0
+requests>=2.31.0
+entsoe-py>=0.6.0
+pandas>=2.0.0

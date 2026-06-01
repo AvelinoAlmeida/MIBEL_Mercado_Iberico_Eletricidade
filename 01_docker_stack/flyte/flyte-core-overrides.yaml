@@ -1,0 +1,17 @@
+# Helm value overrides applied to the flyte-core chart during sandbox bootstrap.
+# They redirect Flyte's artifact storage to the shared MinIO instance running
+# in Docker Compose, reached via host.docker.internal from inside the K3s pods.
+
+storage:
+  type: minio
+  connection:
+    endpoint: "http://host.docker.internal:9000"
+    access-key: minioadmin
+    secret-key: minioadmin
+    disable-ssl: true
+    region: us-east-1
+  container: "flyte"
+
+# Keep the propeller cache in the same MinIO bucket
+propeller:
+  rawoutput-prefix: "s3://flyte/"

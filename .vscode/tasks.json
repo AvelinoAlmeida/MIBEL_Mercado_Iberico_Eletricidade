@@ -1,0 +1,52 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Docker: Start Stack",
+            "type": "shell",
+            "command": "docker compose up -d --build",
+            "options": {
+                "cwd": "${workspaceFolder}/01_docker_stack",
+                "shell": {
+                    "executable": "powershell.exe",
+                    "args": ["-NoProfile", "-Command"]
+                }
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Docker: Stop Stack",
+            "type": "shell",
+            "command": "docker compose down",
+            "options": {
+                "cwd": "${workspaceFolder}/01_docker_stack",
+                "shell": {
+                    "executable": "powershell.exe",
+                    "args": ["-NoProfile", "-Command"]
+                }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Docker: Stack Status",
+            "type": "shell",
+            "command": "docker compose ps",
+            "options": {
+                "cwd": "${workspaceFolder}/01_docker_stack",
+                "shell": {
+                    "executable": "powershell.exe",
+                    "args": ["-NoProfile", "-Command"]
+                }
+            },
+            "problemMatcher": []
+        }
+    ]
+}

@@ -1,0 +1,43 @@
+# Configuração do cliente Flyte para execução remota no cluster local (flytectl demo).
+#
+# Utilizado pelo orquestrador DP-02 Static em modo remoto:
+#   pyflyte run --remote --copy all --config workflows/flyte-config.yaml <workflow> <task>
+#
+# O orquestrador (run_medallion_consumo_precos.py) gere o ciclo de vida do cluster:
+#   1. docker build -t mibel-flyte:latest 01_docker_stack/flyte/
+#   2. flytectl demo start --image mibel-flyte:latest
+#   UI disponível em http://localhost:30080
+#
+# Imagem customizada (01_docker_stack/flyte/Dockerfile):
+#   - Baseada em ghcr.io/flyteorg/flyte-sandbox:latest
+#   - Aplica flyte-core-overrides.yaml: redireciona armazenamento interno
+#     para o MinIO do Compose (host.docker.internal:9000)
+#   - Corrige charts Helm offline e aumenta timeouts de arranque
+#
+# Fast registration (--copy all): faz upload do código local, incluindo
+# os ficheiros SQL de qualidade (04_quality/sql/), para o bucket flyte/ no MinIO.
+# Os CSVs brutos são excluídos via .flyteignore em Static_Data/.
+
+admin:
+  # Control plane do cluster Flyte (K3s gerido pelo flytectl demo)
+  endpoint: localhost:30080
+  authType: Pkce
+  insecure: true
+
+storage:
+  # O host (pyflyte) faz upload dos artefactos de fast registration para
+  # o MinIO do Compose em localhost:9000 (bucket: flyte/).
+  # Os pods K3s em execução no cluster acedem ao mesmo MinIO via
+  # host.docker.internal:9000, conforme configurado em flyte-core-overrides.yaml.
+  type: minio
+  connection:
+    endpoint: "http://localhost:9000"
+    access-key: minioadmin
+    secret-key: minioadmin
+    disable-ssl: true
+    region: us-east-1
+  container: "flyte"
+
+logger:
+  show-source: true
+  level: 0

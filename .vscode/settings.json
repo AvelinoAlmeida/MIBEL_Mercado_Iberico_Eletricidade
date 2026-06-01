@@ -1,0 +1,24 @@
+{
+    "files.exclude": {
+        "**/.venv*/": true,
+        "**/__pycache__/": true,
+        "**/*.pyc": true,
+        "**/.pytest_cache/": true,
+        "**/*.egg-info/": true
+    },
+    "sqltools.connections": [
+        {
+            "trinoOptions": {
+                "ssl": {
+                    "rejectUnauthorized": true
+                }
+            },
+            "previewLimit": 50,
+            "driver": "Trino Driver",
+            "name": "MIBEL Trino",
+            "server": "http://localhost:8080",
+            "catalog": "iceberg",
+            "user": "admin"
+        }
+    ]
+}
